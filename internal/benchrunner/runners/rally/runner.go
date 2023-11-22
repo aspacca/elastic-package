@@ -20,6 +20,10 @@ import (
 	"text/template"
 	"time"
 
+	"github.com/Masterminds/semver/v3"
+
+	"github.com/elastic/elastic-package/internal/formatter"
+
 	"github.com/elastic/elastic-package/internal/packages/installer"
 
 	"github.com/magefile/mage/sh"
@@ -45,12 +49,62 @@ import (
 )
 
 const (
-	// RallyCorpusAgentDir is folder path where rally corporsa files produced by the service
-	// are stored on the Rally container's filesystem.
+	// RallyCorpusAgentDir is folder path where rally corpora files produced by the service
+	// are stored on the Rally host's filesystem.
 	RallyCorpusAgentDir = "/tmp/rally_corpus"
 
-	// BenchType defining rally benchmark
-	BenchType benchrunner.Type = "rally"
+	rallyTrackTemplateForTSDB = `{% import "rally.helpers" as rally with context %}
+{
+    "version": 2,
+    "description": "Track for [[.DataStream]]",
+    "datastream": [
+        {
+            "name": "[[.DataStream]]",
+            "body": "[[.CorpusFilename]]"
+        }
+    ],
+    "corpora": [
+        {
+            "name": "[[.CorpusFilename]]",
+            "documents": [
+                {
+                    "target-data-stream": "[[.DataStream]]",
+                    "source-file": "[[.CorpusFilename]]",
+                    "document-count": [[.CorpusDocsCount]],
+                    "uncompressed-bytes": [[.CorpusSizeInBytes]]
+                }
+            ]
+        }
+    ],
+    "schedule": [
+        {
+            "operation": {
+                "name": "custom-template-setup",
+                "operation-type": "create-component-template",
+                "template": "[[.ComponentTemplate]]",
+                "body": [[.TemplateBody]]
+            },
+            "clients": 1
+        },
+        {
+            "operation": {
+                "operation-type": "bulk",
+                "bulk-size": {{bulk_size | default(5000)}},
+                "ingest-percentage": {{ingest_percentage | default(100)}}
+            },
+            "clients": {{bulk_indexing_clients | default(8)}}
+        },
+        {
+            "operation": {
+                "name": "custom-template-teardown",
+                "operation-type": "create-component-template",
+                "template": "[[.ComponentTemplate]]",
+                "body": [[.OldTemplateBody]]
+            },
+            "clients": 1
+        }
+    ]
+}`
 
 	rallyTrackTemplate = `{% import "rally.helpers" as rally with context %}
 {
@@ -102,11 +156,15 @@ type runner struct {
 	options  Options
 	scenario *scenario
 
-	ctxt              servicedeployer.ServiceContext
-	runtimeDataStream string
-	pipelinePrefix    string
-	generator         genlib.Generator
-	mcollector        *collector
+	ctxt                     servicedeployer.ServiceContext
+	runtimeDataStream        string
+	componentTemplateName    string
+	componentTemplateBody    string
+	oldComponentTempalteBody string
+	pipelinePrefix           string
+	isTSDB                   bool
+	generator                genlib.Generator
+	mcollector               *collector
 
 	corpusFile string
 	trackFile  string
@@ -252,6 +310,28 @@ func (r *runner) setUp() error {
 		r.scenario.Version,
 	)
 
+	r.isTSDB = dataStreamManifest.Elasticsearch.IndexMode == "time_series"
+	if r.isTSDB {
+		indexTemplate := fmt.Sprintf(
+			"%s-%s.%s",
+			dataStreamManifest.Type,
+			pkgManifest.Name,
+			dataStreamManifest.Name,
+		)
+
+		r.componentTemplateName = fmt.Sprintf(
+			"%s-%s.%s@custom",
+			dataStreamManifest.Type,
+			pkgManifest.Name,
+			dataStreamManifest.Name,
+		)
+
+		r.componentTemplateBody, r.oldComponentTempalteBody, err = r.getCustomComponentTemplate(indexTemplate, pkgManifest.SpecVersion)
+		if err != nil {
+			return fmt.Errorf("error getting custom componet template: %s: %w", r.componentTemplateName, err)
+		}
+	}
+
 	if err := r.wipeDataStreamOnSetup(); err != nil {
 		return fmt.Errorf("error deleting old data in data stream: %s: %w", r.runtimeDataStream, err)
 	}
@@ -272,6 +352,103 @@ func (r *runner) setUp() error {
 	}
 
 	return nil
+}
+
+func (r *runner) getCustomComponentTemplate(indexTemplate, specVersion string) (string, string, error) {
+	simulatedTemplate, err := r.options.ESAPI.Indices.SimulateTemplate(r.options.ESAPI.Indices.SimulateTemplate.WithName(indexTemplate))
+	if err != nil {
+		return "", "", fmt.Errorf("error simulating template: %s: %w", indexTemplate, err)
+	}
+	defer simulatedTemplate.Body.Close()
+
+	if simulatedTemplate.IsError() {
+		return "", "", fmt.Errorf("error simulating template: %s: %s", indexTemplate, simulatedTemplate.String())
+	}
+
+	simulatedTemplateBody, err := io.ReadAll(simulatedTemplate.Body)
+	if err != nil {
+		return "", "", fmt.Errorf("error reading simulated template: %s: %w", indexTemplate, err)
+	}
+
+	var unmarshalledSimulatedTemplate map[string]interface{}
+	err = json.Unmarshal(simulatedTemplateBody, &unmarshalledSimulatedTemplate)
+	if err != nil {
+		return "", "", fmt.Errorf("error unmarshaling simulated template: %s: %w", r.componentTemplateName, err)
+	}
+
+	routingPath := unmarshalledSimulatedTemplate["template"].(map[string]interface{})["settings"].(map[string]interface{})["index"].(map[string]interface{})["routing_path"]
+
+	componentTemplate, err := r.options.ESAPI.Cluster.GetComponentTemplate(r.options.ESAPI.Cluster.GetComponentTemplate.WithName(r.componentTemplateName))
+	if err != nil {
+		return "", "", fmt.Errorf("error getting component template: %s: %w", componentTemplate, err)
+	}
+	defer componentTemplate.Body.Close()
+
+	if componentTemplate.IsError() {
+		return "", "", fmt.Errorf("error getting component template: %s: %s", r.componentTemplateName, componentTemplate.String())
+	}
+
+	templateBody, err := io.ReadAll(componentTemplate.Body)
+	if err != nil {
+		return "", "", fmt.Errorf("error reading component template: %s: %w", r.componentTemplateName, err)
+	}
+
+	var unmarshalledComponentTemplate map[string]interface{}
+	err = json.Unmarshal(templateBody, &unmarshalledComponentTemplate)
+	if err != nil {
+		return "", "", fmt.Errorf("error unmarshaling component template: %s: %w", r.componentTemplateName, err)
+	}
+
+	indexTimeSeries := map[string]interface{}{
+		"start_time": "2000-01-01T00:00:00Z",
+		"end_time":   "2099-12-31T23:59:59Z",
+	}
+
+	componentsTemplate, ok := unmarshalledComponentTemplate["component_templates"].([]interface{})
+	if !ok {
+		return "", "", fmt.Errorf("error accessing component_templates for component template: %s: %w", r.componentTemplateName, err)
+	}
+
+	if len(componentsTemplate) != 1 {
+		return "", "", fmt.Errorf("error with empty component_templates for component template: %s: %w", r.componentTemplateName, err)
+	}
+
+	componentTemplateBody, ok := componentsTemplate[0].(map[string]interface{})["component_template"].(map[string]interface{})
+	if !ok {
+		return "", "", fmt.Errorf("error accessing component_template for component template: %s: %w", r.componentTemplateName, err)
+	}
+
+	semVerSpecVersion, err := semver.NewVersion(specVersion)
+	if err != nil {
+		return "", "", fmt.Errorf("error getting spec version: %s: %w", specVersion, err)
+	}
+
+	jsonFormatterBuilder := formatter.JSONFormatterBuilder(*semVerSpecVersion)
+	oldTemplate, err := jsonFormatterBuilder.Encode(componentTemplateBody)
+	if err != nil {
+		return "", "", fmt.Errorf("error json encoding component template: %s: %w", r.componentTemplateName, err)
+	}
+
+	if _, ok := componentTemplateBody["template"].(map[string]interface{})["settings"].(map[string]interface{})["index"].(map[string]interface{}); ok {
+		componentTemplateBody["template"].(map[string]interface{})["settings"].(map[string]interface{})["index"].(map[string]interface{})["mode"] = "time_series"
+		componentTemplateBody["template"].(map[string]interface{})["settings"].(map[string]interface{})["index"].(map[string]interface{})["routing_path"] = routingPath
+		componentTemplateBody["template"].(map[string]interface{})["settings"].(map[string]interface{})["index"].(map[string]interface{})["time_series"] = indexTimeSeries
+	} else {
+		componentTemplateBody["template"].(map[string]interface{})["settings"] = map[string]interface{}{
+			"index": map[string]interface{}{
+				"mode":         "time_series",
+				"routing_path": routingPath,
+				"time_series":  indexTimeSeries,
+			},
+		}
+	}
+
+	newTemplate, err := jsonFormatterBuilder.Encode(componentTemplateBody)
+	if err != nil {
+		return "", "", fmt.Errorf("error json encoding component template: %s: %w", r.componentTemplateName, err)
+	}
+
+	return string(newTemplate), string(oldTemplate), nil
 }
 
 func (r *runner) wipeDataStreamOnSetup() error {
@@ -560,7 +737,17 @@ func (r *runner) runGenerator(destDir string) error {
 		return fmt.Errorf("cannot not create rally track file: %w", err)
 	}
 	r.trackFile = trackFile.Name()
-	rallyTrackContent, err := generateRallyTrack(r.runtimeDataStream, corpusFile, corpusDocsCount)
+
+	rallyTrackContent, err := generateRallyTrack(
+		r.runtimeDataStream,
+		r.componentTemplateName,
+		r.componentTemplateBody,
+		r.oldComponentTempalteBody,
+		corpusFile,
+		corpusDocsCount,
+		r.isTSDB,
+	)
+
 	if err != nil {
 		return fmt.Errorf("cannot not generate rally track content: %w", err)
 	}
@@ -659,7 +846,9 @@ func (r *runner) runRally() ([]rallyStat, error) {
 		fmt.Sprintf(`--track-path=%s`, r.trackFile),
 		fmt.Sprintf(`--client-options={"default":{"basic_auth_user":"%s","basic_auth_password":"%s","use_ssl":true,"verify_certs":false}}`, elasticsearchUsername, elasticsearchPassword),
 		"--pipeline=benchmark-only",
+		"--kill-running-processes",
 	)
+
 	errOutput := new(bytes.Buffer)
 	cmd.Stderr = errOutput
 
@@ -946,7 +1135,7 @@ func getDataStreamPath(packageRoot, dataStream string) string {
 	return filepath.Join(packageRoot, "data_stream", dataStream)
 }
 
-func generateRallyTrack(dataStream string, corpusFile *os.File, corpusDocsCount uint64) ([]byte, error) {
+func generateRallyTrack(dataStream, componentTemplate, componentTemplateBody, oldComponentTempalteBody string, corpusFile *os.File, corpusDocsCount uint64, isTSDB bool) ([]byte, error) {
 	t := template.New("rallytrack")
 
 	parsedTpl, err := t.Delims("[[", "]]").Parse(rallyTrackTemplate)
@@ -961,14 +1150,17 @@ func generateRallyTrack(dataStream string, corpusFile *os.File, corpusDocsCount 
 
 	corpusSizeInBytes := fi.Size()
 
-	buf := new(bytes.Buffer)
 	templateData := map[string]any{
 		"DataStream":        dataStream,
 		"CorpusFilename":    filepath.Base(corpusFile.Name()),
 		"CorpusDocsCount":   corpusDocsCount,
 		"CorpusSizeInBytes": corpusSizeInBytes,
+		"ComponentTemplate": componentTemplate,
+		"TemplateBody":      componentTemplateBody,
+		"OldTemplateBody":   oldComponentTempalteBody,
 	}
 
+	buf := new(bytes.Buffer)
 	err = parsedTpl.Execute(buf, templateData)
 	if err != nil {
 		return nil, fmt.Errorf("error on parsin on rally track template: %w", err)
